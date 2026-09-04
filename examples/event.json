@@ -1,0 +1,8 @@
+{
+  "source": "backup-worker",
+  "external_id": "backup-2026-09-04",
+  "title": "Nightly backup needs attention",
+  "severity": "warning",
+  "body": "The upload completed, but the remote checksum has not been verified.",
+  "url": "https://status.example.com/backups/2026-09-04"
+}
