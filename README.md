@@ -1,5 +1,7 @@
 # Telegram Ops Alerts
 
+[![tests](https://github.com/Utasu/telegram-ops-alerts/actions/workflows/tests.yml/badge.svg)](https://github.com/Utasu/telegram-ops-alerts/actions/workflows/tests.yml)
+
 A dependency-free Python utility that receives JSON operational events, stores them in SQLite, suppresses duplicates, applies a severity threshold, and optionally sends concise Telegram alerts.
 
 ## Why it is useful
