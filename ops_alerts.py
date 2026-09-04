@@ -139,13 +139,6 @@ class AlertStore:
         self.connection.commit()
         return cursor.rowcount == 1
 
-    def mark_notified(self, event: AlertEvent) -> None:
-        self.connection.execute(
-            "UPDATE events SET notified_at=? WHERE fingerprint=?",
-            (now_iso(), event.fingerprint()),
-        )
-        self.connection.commit()
-
     def recent(self, limit: int) -> list[sqlite3.Row]:
         return list(
             self.connection.execute(
@@ -153,19 +146,48 @@ class AlertStore:
             )
         )
 
+    def pending(self, min_severity: str) -> list[sqlite3.Row]:
+        """Stored events that still owe a notification.
+
+        Delivery is decoupled from ingestion on purpose: an event is deduplicated the
+        moment it is stored, so if a send failed we would otherwise skip it forever on
+        the next run and silently lose the alert.
+        """
+        floor = SEVERITY[min_severity]
+        allowed = [name for name, weight in SEVERITY.items() if weight >= floor]
+        placeholders = ",".join("?" * len(allowed))
+        return list(
+            self.connection.execute(
+                f"""SELECT * FROM events
+                    WHERE notified_at IS NULL AND severity IN ({placeholders})
+                    ORDER BY received_at""",
+                allowed,
+            )
+        )
+
+    def mark_notified_fingerprint(self, fingerprint: str) -> None:
+        self.connection.execute(
+            "UPDATE events SET notified_at=? WHERE fingerprint=?", (now_iso(), fingerprint)
+        )
+        self.connection.commit()
+
+
+def render_fields(source: str, title: str, severity: str, body: str, url: str) -> str:
+    icons = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}
+    lines = [f"{icons.get(severity, '•')} {title}", f"Source: {source}", f"Severity: {severity}"]
+    if body:
+        lines.extend(["", body])
+    if url:
+        lines.extend(["", url])
+    return "\n".join(lines)
+
 
 def render_message(event: AlertEvent) -> str:
-    icons = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}
-    lines = [
-        f"{icons[event.severity]} {event.title}",
-        f"Source: {event.source}",
-        f"Severity: {event.severity}",
-    ]
-    if event.body:
-        lines.extend(["", event.body])
-    if event.url:
-        lines.extend(["", event.url])
-    return "\n".join(lines)
+    return render_fields(event.source, event.title, event.severity, event.body, event.url)
+
+
+def render_row(row: sqlite3.Row) -> str:
+    return render_fields(row["source"], row["title"], row["severity"], row["body"], row["url"])
 
 
 def send_telegram(message: str, token: str, chat_id: str) -> None:
@@ -194,6 +216,27 @@ def load_events(path: Path) -> list[AlertEvent]:
     return [AlertEvent.from_dict(value) for value in values]
 
 
+def deliver_pending(store: AlertStore, min_severity: str, sender: Any = send_telegram) -> dict[str, int]:
+    """Send every stored event that still owes a notification.
+
+    One failing event must not block the rest, and nothing is marked as delivered
+    unless the send actually succeeded, so a failed send is retried next run.
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    counts = {"notified": 0, "failed": 0}
+    for row in store.pending(min_severity):
+        try:
+            sender(render_row(row), token, chat_id)
+        except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
+            counts["failed"] += 1
+            print(f"warning: delivery failed, will retry next run: {error}", file=sys.stderr)
+            continue
+        store.mark_notified_fingerprint(row["fingerprint"])
+        counts["notified"] += 1
+    return counts
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=Path(".state/alerts.sqlite3"))
@@ -204,35 +247,37 @@ def main(argv: list[str] | None = None) -> int:
     ingest.add_argument("--send", action="store_true", help="send through Telegram")
     listing = subcommands.add_parser("list", help="show recent stored events")
     listing.add_argument("--limit", type=int, default=20)
+    flush = subcommands.add_parser("flush", help="retry notifications that never went out")
+    flush.add_argument("--min-severity", choices=SEVERITY, default="warning")
     args = parser.parse_args(argv)
 
     store = AlertStore(args.db)
     if args.command == "list":
         for row in store.recent(args.limit):
-            print(f"{row['received_at']} {row['severity']:<8} {row['source']}: {row['title']}")
+            state = "sent" if row["notified_at"] else "pending"
+            print(
+                f"{row['received_at']} {row['severity']:<8} {state:<7} "
+                f"{row['source']}: {row['title']}"
+            )
         return 0
 
-    counts = {"seen": 0, "new": 0, "notified": 0}
+    if args.command == "flush":
+        counts = deliver_pending(store, args.min_severity)
+        print(json.dumps(counts, sort_keys=True))
+        return 1 if counts["failed"] else 0
+
+    counts = {"seen": 0, "new": 0, "notified": 0, "failed": 0}
     for event in load_events(args.input):
         counts["seen"] += 1
         if not store.add(event):
             continue
         counts["new"] += 1
-        if SEVERITY[event.severity] < SEVERITY[args.min_severity]:
-            continue
-        message = render_message(event)
-        if args.send:
-            send_telegram(
-                message,
-                os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-                os.environ.get("TELEGRAM_CHAT_ID", ""),
-            )
-            store.mark_notified(event)
-            counts["notified"] += 1
-        else:
-            print(message)
+        if not args.send and SEVERITY[event.severity] >= SEVERITY[args.min_severity]:
+            print(render_message(event))
+    if args.send:
+        counts.update(deliver_pending(store, args.min_severity))
     print(json.dumps(counts, sort_keys=True))
-    return 0
+    return 1 if counts["failed"] else 0
 
 
 if __name__ == "__main__":
